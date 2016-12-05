@@ -1,0 +1,589 @@
+From 3be4369236a9ba5ff02f43873b588ac39a608252 Mon Sep 17 00:00:00 2001
+From: changzhi <changzhi@unitedstack.com>
+Date: Mon, 5 Dec 2016 14:57:14 +0800
+Subject: [PATCH] Add new extensions to Neutron LBaaS v2.0
+
+Two new extensions:
+1. Add "procs" into LoadBalancers.
+2. Add "option keep-alive" to pools and listeners.
+---
+ neutron_lbaas/db/loadbalancer/loadbalancer_dbv2.py |  9 +++
+ neutron_lbaas/db/loadbalancer/models.py            |  3 +
+ .../newton/expand/37d03c8b3d4e_add_procs_to_lb.py  | 34 ++++++++++
+ ...b5fb799b_add_keep_alive_to_listener_and_pool.py | 35 ++++++++++
+ neutron_lbaas/drivers/haproxy/jinja_cfg.py         | 33 ++++++++--
+ neutron_lbaas/drivers/haproxy/namespace_driver.py  |  4 +-
+ .../drivers/haproxy/templates/haproxy_base.j2      | 24 +++++++
+ .../drivers/haproxy/templates/haproxy_proxies.j2   |  6 ++
+ neutron_lbaas/extensions/keep_alive.py             | 75 ++++++++++++++++++++++
+ neutron_lbaas/extensions/lb_procs.py               | 62 ++++++++++++++++++
+ neutron_lbaas/services/loadbalancer/data_models.py | 15 +++--
+ neutron_lbaas/services/loadbalancer/plugin.py      |  2 +
+ 12 files changed, 289 insertions(+), 13 deletions(-)
+ create mode 100644 neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/37d03c8b3d4e_add_procs_to_lb.py
+ create mode 100644 neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/fe67b5fb799b_add_keep_alive_to_listener_and_pool.py
+ create mode 100644 neutron_lbaas/extensions/keep_alive.py
+ create mode 100644 neutron_lbaas/extensions/lb_procs.py
+
+diff --git a/neutron_lbaas/db/loadbalancer/loadbalancer_dbv2.py b/neutron_lbaas/db/loadbalancer/loadbalancer_dbv2.py
+index f1aa3b2..071b27b 100644
+--- a/neutron_lbaas/db/loadbalancer/loadbalancer_dbv2.py
++++ b/neutron_lbaas/db/loadbalancer/loadbalancer_dbv2.py
+@@ -37,6 +37,7 @@ from sqlalchemy.orm import lazyload
+ from neutron_lbaas._i18n import _
+ from neutron_lbaas import agent_scheduler
+ from neutron_lbaas.db.loadbalancer import models
++from neutron_lbaas.extensions import keep_alive
+ from neutron_lbaas.extensions import l7
+ from neutron_lbaas.extensions import loadbalancerv2
+ from neutron_lbaas.extensions import sharedpools
+@@ -387,6 +388,10 @@ class LoadBalancerPluginDbv2(base_db.CommonDbMixin,
+     def _validate_listener_data(self, context, listener):
+         pool_id = listener.get('default_pool_id')
+         lb_id = listener.get('loadbalancer_id')
++        is_keep_alive = listener.get('keep_alive', False)
++        protocol = listener.get('protocol')
++        if is_keep_alive and protocol == 'TCP':
++            raise keep_alive.ListenerKeepaliveOptionInvaild()
+         if lb_id:
+             if not self._resource_exists(context, models.LoadBalancer,
+                                          lb_id):
+@@ -602,6 +607,10 @@ class LoadBalancerPluginDbv2(base_db.CommonDbMixin,
+             self._load_id(context, pool)
+             pool['provisioning_status'] = constants.PENDING_CREATE
+             pool['operating_status'] = lb_const.OFFLINE
++            is_keep_alive = pool.get('keep_alive', False)
++            protocol = pool.get('protocol')
++            if is_keep_alive and protocol == 'TCP':
++                raise keep_alive.PoolKeepaliveOptionInvaild()
+ 
+             session_info = pool.pop('session_persistence', None)
+             pool_db = models.PoolV2(**pool)
+diff --git a/neutron_lbaas/db/loadbalancer/models.py b/neutron_lbaas/db/loadbalancer/models.py
+index fb91a77..56bd37a 100644
+--- a/neutron_lbaas/db/loadbalancer/models.py
++++ b/neutron_lbaas/db/loadbalancer/models.py
+@@ -137,6 +137,7 @@ class LoadBalancer(model_base.BASEV2, model_base.HasId, model_base.HasProject):
+     operating_status = sa.Column(sa.String(16), nullable=False)
+     admin_state_up = sa.Column(sa.Boolean(), nullable=False)
+     vip_port = orm.relationship(models_v2.Port)
++    procs = sa.Column(sa.Integer, nullable=True)
+     stats = orm.relationship(
+         LoadBalancerStatistics,
+         uselist=False,
+@@ -171,6 +172,7 @@ class PoolV2(model_base.BASEV2, model_base.HasId, model_base.HasProject):
+ 
+     name = sa.Column(sa.String(255), nullable=True)
+     description = sa.Column(sa.String(255), nullable=True)
++    keep_alive = sa.Column(sa.Boolean(), nullable=True)
+     loadbalancer_id = sa.Column(sa.String(36), sa.ForeignKey(
+         "lbaas_loadbalancers.id"))
+     healthmonitor_id = sa.Column(sa.String(36),
+@@ -351,6 +353,7 @@ class Listener(model_base.BASEV2, model_base.HasId, model_base.HasProject):
+     admin_state_up = sa.Column(sa.Boolean(), nullable=False)
+     provisioning_status = sa.Column(sa.String(16), nullable=False)
+     operating_status = sa.Column(sa.String(16), nullable=False)
++    keep_alive = sa.Column(sa.Boolean(), nullable=True)
+     default_pool = orm.relationship(
+         PoolV2, backref=orm.backref("listeners"), lazy='joined')
+     loadbalancer = orm.relationship(
+diff --git a/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/37d03c8b3d4e_add_procs_to_lb.py b/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/37d03c8b3d4e_add_procs_to_lb.py
+new file mode 100644
+index 0000000..1778042
+--- /dev/null
++++ b/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/37d03c8b3d4e_add_procs_to_lb.py
+@@ -0,0 +1,34 @@
++# Copyright 2016 <Zhi Chang/UnitedStack>
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++
++"""Add procs to lbaas_loadbalancers
++
++Revision ID: 37d03c8b3d4e
++Revises: 844352f9fe6f
++Create Date: 2016-11-30 10:55:03.105746
++
++"""
++
++# revision identifiers, used by Alembic.
++revision = '37d03c8b3d4e'
++down_revision = '844352f9fe6f'
++
++from alembic import op
++import sqlalchemy as sa
++
++
++def upgrade():
++    op.add_column('lbaas_loadbalancers', sa.Column(
++        u'procs', sa.Integer(), nullable=True))
+diff --git a/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/fe67b5fb799b_add_keep_alive_to_listener_and_pool.py b/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/fe67b5fb799b_add_keep_alive_to_listener_and_pool.py
+new file mode 100644
+index 0000000..0b3c95a
+--- /dev/null
++++ b/neutron_lbaas/db/migration/alembic_migrations/versions/newton/expand/fe67b5fb799b_add_keep_alive_to_listener_and_pool.py
+@@ -0,0 +1,35 @@
++# Copyright 2014 OpenStack Foundation
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++
++"""add_keep_alive_to_listener_and_pool
++
++Revision ID: fe67b5fb799b
++Revises: 37d03c8b3d4e
++Create Date: 2015-02-05 10:50:15.606420
++
++"""
++
++# revision identifiers, used by Alembic.
++revision = 'fe67b5fb799b'
++down_revision = '37d03c8b3d4e'
++
++from alembic import op
++import sqlalchemy as sa
++
++def upgrade():
++    op.add_column(
++        u'lbaas_listeners', sa.Boolean(), nullable=True)
++    op.add_column(
++        u'lbaas_pools', sa.Boolean(), nullable=True)
+diff --git a/neutron_lbaas/drivers/haproxy/jinja_cfg.py b/neutron_lbaas/drivers/haproxy/jinja_cfg.py
+index 5b8c36a..a8ce7f2 100644
+--- a/neutron_lbaas/drivers/haproxy/jinja_cfg.py
++++ b/neutron_lbaas/drivers/haproxy/jinja_cfg.py
+@@ -62,20 +62,30 @@ TEMPLATES_DIR = os.path.abspath(
+     os.path.join(os.path.dirname(__file__), 'templates/'))
+ JINJA_ENV = None
+ 
++BIND_ALL_CPUS = 'all'
++BIND_ODD_CPUS = 'odd'
++BIND_EVEN_CPUS = 'even'
++
+ jinja_opts = [
+     cfg.StrOpt(
+         'jinja_config_template',
+         default=os.path.join(
+             TEMPLATES_DIR,
+             'haproxy.loadbalancer.j2'),
+-        help=_('Jinja template file for haproxy configuration'))
++        help=_('Jinja template file for haproxy configuration')),
++    cfg.StrOpt(
++        'cpu_binding',
++        default=BIND_ALL_CPUS,
++        choices=(BIND_ALL_CPUS, BIND_ODD_CPUS, BIND_EVEN_CPUS),
++        help=_("TODO"),
++    )
+ ]
+ 
+ cfg.CONF.register_opts(jinja_opts, 'haproxy')
+ 
+ 
+ def save_config(conf_path, loadbalancer, socket_path, user_group,
+-                haproxy_base_dir):
++                haproxy_base_dir, procs):
+     """Convert a logical configuration to the HAProxy version.
+ 
+     :param conf_path: location of Haproxy configuration
+@@ -83,11 +93,14 @@ def save_config(conf_path, loadbalancer, socket_path, user_group,
+     :param socket_path: location of haproxy socket data
+     :param user_group: user group
+     :param haproxy_base_dir: location of the instances state data
++    "param procs: count of each loadbalancer process
+     """
+     config_str = render_loadbalancer_obj(loadbalancer,
+                                          user_group,
+                                          socket_path,
+-                                         haproxy_base_dir)
++                                         haproxy_base_dir,
++                                         constants.CPU_BINDING,
++                                         procs)
+     n_utils.replace_file(conf_path, config_str)
+ 
+ 
+@@ -222,18 +235,24 @@ def _build_pem(tls_cert):
+ 
+ 
+ def render_loadbalancer_obj(loadbalancer, user_group, socket_path,
+-                            haproxy_base_dir):
++                            cpu_binding, haproxy_base_dir, procs):
+     """Renders load balancer object
+ 
+     :param loadbalancer: the load balancer object
+     :param user_group: the user group
+     :param socket_path: location of the instances socket data
++    :param cpu_binding: CPU binding info
+     :param haproxy_base_dir:  location of the instances state data
++    :param procs: count of process in each loadbalancer
+     :returns: rendered load balancer configuration
+     """
+     loadbalancer = _transform_loadbalancer(loadbalancer, haproxy_base_dir)
++    if not procs:
++        procs = 0
+     return _get_template().render({'loadbalancer': loadbalancer,
+                                    'user_group': user_group,
++                                   'cpu_binding': cpu_binding,
++                                   'nbproc': [n for n in range(1, procs + 1)],
+                                    'stats_sock': socket_path},
+                                   constants=constants)
+ 
+@@ -268,7 +287,8 @@ def _transform_listener(listener, haproxy_base_dir):
+         'id': listener.id,
+         'protocol_port': listener.protocol_port,
+         'protocol_mode': PROTOCOL_MAP[listener.protocol],
+-        'protocol': listener.protocol
++        'protocol': listener.protocol,
++        'keep_alive': listener.keep_alive
+     }
+     if listener.connection_limit and listener.connection_limit > -1:
+         ret_value['connection_limit'] = listener.connection_limit
+@@ -301,7 +321,8 @@ def _transform_pool(pool):
+         'health_monitor': '',
+         'session_persistence': '',
+         'admin_state_up': pool.admin_state_up,
+-        'provisioning_status': pool.provisioning_status
++        'provisioning_status': pool.provisioning_status,
++        'keep_alive': listener.keep_alive
+     }
+     members = [_transform_member(x)
+                for x in pool.members if _include_member(x)]
+diff --git a/neutron_lbaas/drivers/haproxy/namespace_driver.py b/neutron_lbaas/drivers/haproxy/namespace_driver.py
+index c01e55f..d753fe1 100644
+--- a/neutron_lbaas/drivers/haproxy/namespace_driver.py
++++ b/neutron_lbaas/drivers/haproxy/namespace_driver.py
+@@ -366,13 +366,15 @@ class HaproxyNSDriver(agent_device_driver.AgentDeviceDriver):
+                                              'haproxy.pid')
+         sock_path = self._get_state_file_path(loadbalancer.id,
+                                               'haproxy_stats.sock')
++        procs = loadbalancer.procs
+         user_group = self.conf.haproxy.user_group
+         haproxy_base_dir = self._get_state_file_path(loadbalancer.id, '')
+         jinja_cfg.save_config(conf_path,
+                               loadbalancer,
+                               sock_path,
+                               user_group,
+-                              haproxy_base_dir)
++                              haproxy_base_dir,
++                              procs)
+         cmd = ['haproxy', '-f', conf_path, '-p', pid_path]
+         cmd.extend(extra_cmd_args)
+ 
+diff --git a/neutron_lbaas/drivers/haproxy/templates/haproxy_base.j2 b/neutron_lbaas/drivers/haproxy/templates/haproxy_base.j2
+index e405c95..879fd43 100644
+--- a/neutron_lbaas/drivers/haproxy/templates/haproxy_base.j2
++++ b/neutron_lbaas/drivers/haproxy/templates/haproxy_base.j2
+@@ -21,6 +21,30 @@ global
+     log /dev/log local0
+     log /dev/log local1 notice
+     stats socket {{ sock_path }} mode 0666 level user
++    {% if cpu_binding == 'odd' %}
++        {% set r = 1 %}
++        {% for n in nbproc %}
++            {{ "cpu-map %s %s"|format(n, r) }}
++            {% set r = r + 2 %}
++        {% endfor %}
++    stats bind-process {{ cpu_binding }}
++    {% endif %}
++    {% if cpu_binding == 'even' %}
++        {% set r = 2 %}
++        {% for n in nbproc %}
++            {{ "cpu-map %s %s"|format(n, r) }}
++            {% set r = r + 2 %}
++        {% endfor %}
++    stats bind-process {{ cpu_binding }}
++    {% endif %}
++    {% if cpu_binding == 'all' %}
++        {% set r = 1 %}
++        {% for n in nbproc %}
++            {{ "cpu-map %s %s"|format(n, r) }}
++            {% set r = r + 1 %}
++        {% endfor %}
++    stats bind-process {{ cpu_binding }}
++    {% endif %}
+ 
+ defaults
+     log global
+diff --git a/neutron_lbaas/drivers/haproxy/templates/haproxy_proxies.j2 b/neutron_lbaas/drivers/haproxy/templates/haproxy_proxies.j2
+index 573533a..c96582a 100644
+--- a/neutron_lbaas/drivers/haproxy/templates/haproxy_proxies.j2
++++ b/neutron_lbaas/drivers/haproxy/templates/haproxy_proxies.j2
+@@ -41,6 +41,9 @@ frontend {{ listener.id }}
+ {% if listener.protocol == constants.PROTOCOL_TERMINATED_HTTPS %}
+     redirect scheme https if !{ ssl_fc }
+ {% endif %}
++{% if listener.keep_alive %}
++    option http-keep-alive
++{% endif %}
+ {% if listener.connection_limit is defined %}
+     maxconn {{ listener.connection_limit }}
+ {% endif %}
+@@ -57,6 +60,9 @@ frontend {{ listener.id }}
+ {% macro backend_macro(constants, pool) %}
+ backend {{ pool.id }}
+     mode {{ pool.protocol }}
++    {% if pool.keep_alive %}
++    option http-keep-alive
++    {% endif %}
+     balance {{ pool.lb_algorithm }}
+ {% if pool.session_persistence %}
+ {% if pool.session_persistence.type == constants.SESSION_PERSISTENCE_SOURCE_IP %}
+diff --git a/neutron_lbaas/extensions/keep_alive.py b/neutron_lbaas/extensions/keep_alive.py
+new file mode 100644
+index 0000000..4466444
+--- /dev/null
++++ b/neutron_lbaas/extensions/keep_alive.py
+@@ -0,0 +1,75 @@
++# Copyright 2016 UnitedStack
++# All rights reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from neutron.api import extensions
++from neutron_lib.api import converters
++from neutron_lib import constants as n_constants
++
++DEFAULT_PROCS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
++
++EXTENDED_ATTRIBUTES_2_0 = {
++    'listeners': {
++        'keep_alive': {'allow_post': True, 'allow_put': False,
++                           'default': False,
++                           'convert_to': converters.convert_to_boolean,
++                           'is_visible': True},
++    },
++    'pools': {
++        'keep_alive': {'allow_post': True, 'allow_put': False,
++                           'default': False,
++                           'convert_to': converters.convert_to_boolean,
++                           'is_visible': True},
++    },
++}
++
++
++class ListenerKeepaliveOptionInvaild(nexception.NotFound):
++    message = _("TCP listener can not be added keep_alive option.")
++
++
++class PoolKeepaliveOptionInvaild(nexception.NotFound):
++    message = _("TCP pool can not be added keep_alive option.")
++
++
++class Keep_alive(extensions.ExtensionDescriptor):
++
++    @classmethod
++    def get_name(cls):
++        return "Add keep_alive to listeners and pools"
++
++    @classmethod
++    def get_alias(cls):
++        return "keep_alive"
++
++    @classmethod
++    def get_description(cls):
++        return "Add keep_alive to listeners and pools"
++
++    @classmethod
++    def get_namespace(cls):
++        return "http://wiki.openstack.org/neutron/LBaaS/API_2.0"
++
++    @classmethod
++    def get_updated(cls):
++        return "2016-09-09T22:00:00-00:00"
++
++    def get_required_extensions(self):
++        return ["lbaasv2"]
++
++    def get_extended_resources(self, version):
++        if version == "2.0":
++            return EXTENDED_ATTRIBUTES_2_0
++        else:
++            return {}
+diff --git a/neutron_lbaas/extensions/lb_procs.py b/neutron_lbaas/extensions/lb_procs.py
+new file mode 100644
+index 0000000..414e02e
+--- /dev/null
++++ b/neutron_lbaas/extensions/lb_procs.py
+@@ -0,0 +1,62 @@
++# Copyright 2016 UnitedStack
++# All rights reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from neutron.api import extensions
++from neutron_lib.api import converters
++from neutron_lib import constants as n_constants
++
++DEFAULT_PROCS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
++
++EXTENDED_ATTRIBUTES_2_0 = {
++    'loadbalancers': {
++        'procs': {'allow_post': True, 'allow_put': False,
++                          'convert_to': converters.convert_to_int,
++                          'validate': {'type:values': DEFAULT_PROCS},
++                          'is_visible': True,
++                          'default': 1},
++    }
++}
++
++
++class Lb_procs(extensions.ExtensionDescriptor):
++
++    @classmethod
++    def get_name(cls):
++        return "Add loadbalancer procs"
++
++    @classmethod
++    def get_alias(cls):
++        return "lb_procs"
++
++    @classmethod
++    def get_description(cls):
++        return "Add loadbalaner procs"
++
++    @classmethod
++    def get_namespace(cls):
++        return "http://wiki.openstack.org/neutron/LBaaS/API_2.0"
++
++    @classmethod
++    def get_updated(cls):
++        return "2016-09-09T22:00:00-00:00"
++
++    def get_required_extensions(self):
++        return ["lbaasv2"]
++
++    def get_extended_resources(self, version):
++        if version == "2.0":
++            return EXTENDED_ATTRIBUTES_2_0
++        else:
++            return {}
+diff --git a/neutron_lbaas/services/loadbalancer/data_models.py b/neutron_lbaas/services/loadbalancer/data_models.py
+index 963dfc4..cff52b4 100644
+--- a/neutron_lbaas/services/loadbalancer/data_models.py
++++ b/neutron_lbaas/services/loadbalancer/data_models.py
+@@ -370,7 +370,7 @@ class Pool(BaseDataModel):
+               'protocol', 'lb_algorithm', 'admin_state_up', 'operating_status',
+               'provisioning_status', 'members', 'healthmonitor',
+               'session_persistence', 'loadbalancer_id', 'loadbalancer',
+-              'listener', 'listeners', 'l7_policies']
++              'listener', 'listeners', 'l7_policies', 'keep_alive']
+ 
+     # Map deprecated attribute names to new ones.
+     attr_mapping = {'sessionpersistence': 'session_persistence'}
+@@ -381,10 +381,11 @@ class Pool(BaseDataModel):
+                  provisioning_status=None, members=None, healthmonitor=None,
+                  session_persistence=None, loadbalancer_id=None,
+                  loadbalancer=None, listener=None, listeners=None,
+-                 l7_policies=None):
++                 l7_policies=None, keep_alive=None,):
+         self.id = id
+         self.tenant_id = tenant_id
+         self.name = name
++        self.keep_alive = keep_alive
+         self.description = description
+         self.healthmonitor_id = healthmonitor_id
+         self.protocol = protocol
+@@ -633,7 +634,7 @@ class Listener(BaseDataModel):
+               'loadbalancer_id', 'protocol', 'default_tls_container_id',
+               'sni_containers', 'protocol_port', 'connection_limit',
+               'admin_state_up', 'provisioning_status', 'operating_status',
+-              'default_pool', 'loadbalancer', 'l7_policies']
++              'default_pool', 'loadbalancer', 'l7_policies', 'keep_alive']
+ 
+     def __init__(self, id=None, tenant_id=None, name=None, description=None,
+                  default_pool_id=None, loadbalancer_id=None, protocol=None,
+@@ -641,7 +642,7 @@ class Listener(BaseDataModel):
+                  protocol_port=None, connection_limit=None,
+                  admin_state_up=None, provisioning_status=None,
+                  operating_status=None, default_pool=None, loadbalancer=None,
+-                 l7_policies=None):
++                 l7_policies=None, keep_alive=None):
+         self.id = id
+         self.tenant_id = tenant_id
+         self.name = name
+@@ -649,6 +650,7 @@ class Listener(BaseDataModel):
+         self.default_pool_id = default_pool_id
+         self.loadbalancer_id = loadbalancer_id
+         self.protocol = protocol
++        self.keep_alive = keep_alive
+         self.default_tls_container_id = default_tls_container_id
+         self.sni_containers = sni_containers or []
+         self.protocol_port = protocol_port
+@@ -703,12 +705,12 @@ class LoadBalancer(BaseDataModel):
+     fields = ['id', 'tenant_id', 'name', 'description', 'vip_subnet_id',
+               'vip_port_id', 'vip_address', 'provisioning_status',
+               'operating_status', 'admin_state_up', 'vip_port', 'stats',
+-              'provider', 'listeners', 'pools', 'flavor_id']
++              'provider', 'listeners', 'pools', 'flavor_id', 'procs']
+ 
+     def __init__(self, id=None, tenant_id=None, name=None, description=None,
+                  vip_subnet_id=None, vip_port_id=None, vip_address=None,
+                  provisioning_status=None, operating_status=None,
+-                 admin_state_up=None, vip_port=None, stats=None,
++                 admin_state_up=None, vip_port=None, stats=None, procs=None,
+                  provider=None, listeners=None, pools=None, flavor_id=None):
+         self.id = id
+         self.tenant_id = tenant_id
+@@ -723,6 +725,7 @@ class LoadBalancer(BaseDataModel):
+         self.vip_port = vip_port
+         self.stats = stats
+         self.provider = provider
++        self.procs = procs
+         self.listeners = listeners or []
+         self.flavor_id = flavor_id
+         self.pools = pools or []
+diff --git a/neutron_lbaas/services/loadbalancer/plugin.py b/neutron_lbaas/services/loadbalancer/plugin.py
+index a74d179..195f405 100644
+--- a/neutron_lbaas/services/loadbalancer/plugin.py
++++ b/neutron_lbaas/services/loadbalancer/plugin.py
+@@ -68,6 +68,8 @@ class LoadBalancerPluginv2(loadbalancerv2.LoadBalancerPluginBaseV2):
+                                    "service-type",
+                                    "lb-graph",
+                                    "lb_network_vip",
++                                   "lb_procs",
++                                   "keep_alive",
+                                    "hm_max_retries_down"]
+     path_prefix = loadbalancerv2.LOADBALANCERV2_PREFIX
+ 
+-- 
+2.8.4 (Apple Git-73)
+
