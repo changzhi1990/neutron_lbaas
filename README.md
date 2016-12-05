@@ -4,11 +4,13 @@
 HAProxy can use `cpu-map` to configure one or more subprocess
 and we can set binding relationship between each subprocess and
 physical CPU, example:
+
             cpu-map 1 2
             cpu-map 2 4
             cpu-map 3 6
             cpu-map 4 8
             cpu-map 5 10
+
 These configuration shows that five subprocess(1 2 3 4 5) binds its own
 physical CPU(2 4 6 8 10).
 
